@@ -1,9 +1,11 @@
-// Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
+// Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and a connected controller → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Controller map (Nintendo layout): A/B/X/Y shoulders and triggers, Menu/Options for +/−, the d-pad, stick presses and both sticks.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#import <GameController/GameController.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -11,15 +13,21 @@
 #include <signal.h>
 
 static CAMetalLayer *g_layer;
-static uint64_t g_btn;
+static uint64_t g_btn;        // keyboard bits
+static uint64_t g_pbtn;       // controller bits
 static int g_w, g_a, g_s, g_d;
+static float g_plx, g_ply, g_prx, g_pry;   // controller sticks, -1..1
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
 int front_screen_max_fps(void) { return g_screen_fps; }
 static void push(void) {
     int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    dm_input_set(g_btn, lx, ly, 0, 0);
+    int32_t rx = 0, ry = 0;
+    // A moved controller stick wins over WASD: it is the finer input when one is connected
+    if (fabsf(g_plx) > 0.08f || fabsf(g_ply) > 0.08f) { lx = (int32_t)(g_plx * 32767); ly = (int32_t)(g_ply * 32767); }
+    if (fabsf(g_prx) > 0.08f || fabsf(g_pry) > 0.08f) { rx = (int32_t)(g_prx * 32767); ry = (int32_t)(g_pry * 32767); }
+    dm_input_set(g_btn | g_pbtn, lx, ly, rx, ry);
 }
 static int key_bit(unsigned short code) {
     switch (code) {
@@ -38,6 +46,53 @@ static void on_key(NSEvent *e, int down) {
     uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
     g_btn = down ? (g_btn | m) : (g_btn & ~m);
     push();
+}
+
+// ---- Connected controller (GameController framework): the Mac front end had keyboard input only ----
+// Nintendo layout on the pad itself: A/B/X/Y map straight across (on an Xbox pad A is the bottom button, which is what
+// the game's "A" means here, so no swap); triggers are ZL/ZR, shoulders L/R, Menu/Options are +/−, and the right stick
+// feeds the camera. Sticks are taken as they are, y positive up like the keyboard's W.
+static void sync_pad(GCExtendedGamepad *p) {
+    uint64_t m = 0;
+    if (p.buttonA.isPressed) m |= 1ull << 0;
+    if (p.buttonB.isPressed) m |= 1ull << 1;
+    if (p.buttonX.isPressed) m |= 1ull << 2;
+    if (p.buttonY.isPressed) m |= 1ull << 3;
+    if (p.leftThumbstickButton.isPressed) m |= 1ull << 4;
+    if (p.rightThumbstickButton.isPressed) m |= 1ull << 5;
+    if (p.leftShoulder.isPressed) m |= 1ull << 6;
+    if (p.rightShoulder.isPressed) m |= 1ull << 7;
+    if (p.leftTrigger.isPressed) m |= 1ull << 8;
+    if (p.rightTrigger.isPressed) m |= 1ull << 9;
+    if (p.buttonMenu.isPressed) m |= 1ull << 10;
+    if (p.buttonOptions.isPressed) m |= 1ull << 11;
+    if (p.dpad.left.isPressed) m |= 1ull << 12;
+    if (p.dpad.up.isPressed) m |= 1ull << 13;
+    if (p.dpad.right.isPressed) m |= 1ull << 14;
+    if (p.dpad.down.isPressed) m |= 1ull << 15;
+    g_pbtn = m;
+    g_plx = p.leftThumbstick.xAxis.value;  g_ply = p.leftThumbstick.yAxis.value;
+    g_prx = p.rightThumbstick.xAxis.value; g_pry = p.rightThumbstick.yAxis.value;
+    push();
+}
+
+static void attach_pad(GCController *c) {
+    GCExtendedGamepad *p = c.extendedGamepad;
+    if (!p) { LOG("controller %s has no extended profile; ignored", c.vendorName.UTF8String ?: "?"); return; }
+    c.handlerQueue = dispatch_get_main_queue();
+    p.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *e) { (void)e; sync_pad(g); };
+    sync_pad(p);
+    LOG("controller connected: %s", c.vendorName.UTF8String ?: "?");
+}
+
+static void setup_pads(void) {
+    for (GCController *c in GCController.controllers) attach_pad(c);
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *n) { attach_pad(n.object); }];
+    [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *n) { (void)n; g_pbtn = 0; g_plx = g_ply = g_prx = g_pry = 0; push(); }];
+    [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
 }
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -68,6 +123,7 @@ void front_run(void (*guest)(void)) {
         [win makeKeyAndOrderFront:nil];
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
         [NSApp activateIgnoringOtherApps:YES];
+        setup_pads();
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
